@@ -173,7 +173,7 @@ app.add_middleware(
     allow_headers=["X-API-Key", "Content-Type", "Stripe-Signature"],
 )
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/static", StaticFiles(directory="/app/static"), name="static")
 
 # --- API usage logging middleware ---
 @app.middleware("http")

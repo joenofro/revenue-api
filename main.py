@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Header, Request, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -172,6 +173,7 @@ app.add_middleware(
     allow_headers=["X-API-Key", "Content-Type", "Stripe-Signature"],
 )
 
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # --- API usage logging middleware ---
 @app.middleware("http")

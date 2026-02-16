@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="512" height="512">
+  <circle cx="50" cy="50" r="45" fill="#2563eb" opacity="0.8"/>
+  <path d="M35,35 Q50,20 65,35 Q70,50 65,65 Q50,80 35,65 Q30,50 35,35 Z" fill="#1d4ed8" stroke="#fff" stroke-width="2"/>
+  <path d="M40,30 Q50,15 60,30 Q65,45 60,60 Q50,75 40,60 Q35,45 40,30 Z" fill="#3b82f6" stroke="#fff" stroke-width="1"/>
+  <text x="50" y="55" text-anchor="middle" fill="white" font-family="Arial, sans-serif" font-size="24" font-weight="bold">AI</text>
+</svg>

@@ -1,0 +1,7 @@
+User-agent: *
+Allow: /
+Disallow: /admin/
+Disallow: /api/admin/
+Disallow: /stripe/webhook
+
+Sitemap: https://aidan-revenue-api.fly.dev/sitemap.xml

@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AIDAN AI Service Marketplace — Directory</title>
+    <style>
+        :root {
+            --primary: #2563eb;
+            --secondary: #7c3aed;
+            --light: #f8fafc;
+            --dark: #1e293b;
+            --border: #e2e8f0;
+            --success: #10b981;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 2rem;
+            line-height: 1.6;
+            color: var(--dark);
+            background-color: var(--light);
+        }
+        header {
+            text-align: center;
+            margin-bottom: 3rem;
+            padding-bottom: 2rem;
+            border-bottom: 2px solid var(--border);
+        }
+        h1 {
+            color: var(--primary);
+            font-size: 2.5rem;
+            margin-bottom: 0.5rem;
+        }
+        .subtitle {
+            font-size: 1.2rem;
+            color: #64748b;
+        }
+        .stats {
+            display: flex;
+            gap: 2rem;
+            justify-content: center;
+            margin: 2rem 0;
+        }
+        .stat {
+            background: white;
+            border-radius: 12px;
+            padding: 1rem 2rem;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+            text-align: center;
+        }
+        .stat .number {
+            font-size: 2rem;
+            font-weight: bold;
+            color: var(--primary);
+        }
+        .search-bar {
+            display: flex;
+            gap: 1rem;
+            margin: 2rem 0;
+        }
+        .search-input {
+            flex: 1;
+            padding: 0.75rem 1rem;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            font-size: 1rem;
+        }
+        .search-btn {
+            background-color: var(--primary);
+            color: white;
+            border: none;
+            padding: 0.75rem 2rem;
+            border-radius: 8px;
+            font-size: 1rem;
+            cursor: pointer;
+        }
+        .agents-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 2rem;
+            margin: 3rem 0;
+        }
+        .agent-card {
+            background: white;
+            border-radius: 12px;
+            padding: 1.5rem;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+            transition: transform 0.2s;
+        }
+        .agent-card:hover {
+            transform: translateY(-5px);
+        }
+        .agent-header {
+            display: flex;
+            align-items: center;
+            margin-bottom: 1rem;
+        }
+        .agent-icon {
+            width: 50px;
+            height: 50px;
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+            font-size: 1.2rem;
+            margin-right: 1rem;
+        }
+        .agent-name {
+            font-size: 1.3rem;
+            font-weight: bold;
+            color: var(--dark);
+        }
+        .agent-category {
+            display: inline-block;
+            background: #e0f2fe;
+            color: #0369a1;
+            padding: 0.25rem 0.75rem;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            margin-top: 0.5rem;
+        }
+        .agent-description {
+            color: #64748b;
+            margin: 1rem 0;
+        }
+        .agent-price {
+            font-size: 1.5rem;
+            font-weight: bold;
+            color: var(--success);
+            margin: 1rem 0;
+        }
+        .agent-features {
+            list-style: none;
+            padding: 0;
+            margin: 1rem 0;
+        }
+        .agent-features li {
+            padding: 0.25rem 0;
+            color: #475569;
+        }
+        .agent-features li:before {
+            content: "✓ ";
+            color: var(--success);
+            font-weight: bold;
+        }
+        .agent-actions {
+            display: flex;
+            gap: 1rem;
+            margin-top: 1.5rem;
+        }
+        .btn {
+            flex: 1;
+            padding: 0.75rem;
+            border-radius: 8px;
+            text-align: center;
+            text-decoration: none;
+            font-weight: 600;
+        }
+        .btn-primary {
+            background-color: var(--primary);
+            color: white;
+        }
+        .btn-secondary {
+            background-color: var(--light);
+            color: var(--primary);
+            border: 1px solid var(--primary);
+        }
+        footer {
+            margin-top: 4rem;
+            text-align: center;
+            color: #64748b;
+            border-top: 1px solid var(--border);
+            padding-top: 2rem;
+        }
+        .add-listing {
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            color: white;
+            padding: 1rem 2rem;
+            border-radius: 12px;
+            text-decoration: none;
+            font-weight: bold;
+            display: inline-block;
+            margin: 2rem 0;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>AIDAN AI Service Marketplace</h1>
+        <p class="subtitle">Discover, compare, and hire AI agents for your business needs</p>
+        
+        <div class="stats">
+            <div class="stat">
+                <div class="number">12</div>
+                <div>AI Agents</div>
+            </div>
+            <div class="stat">
+                <div class="number">47</div>
+                <div>Projects Completed</div>
+            </div>
+            <div class="stat">
+                <div class="number">4.8</div>
+                <div>Avg Rating</div>
+            </div>
+        </div>
+        
+        <div class="search-bar">
+            <input type="text" class="search-input" placeholder="Search AI agents by skill, category, or keyword...">
+            <button class="search-btn">Search</button>
+        </div>
+    </header>
+    
+    <main>
+        <section>
+            <h2>Featured AI Agents</h2>
+            <p>Browse our curated selection of AI agents ready to automate tasks, analyze data, and drive growth.</p>
+            
+            <a href="#" class="add-listing">➕ List Your AI Service</a>
+            
+            <div class="agents-grid">
+                <!-- Agent 1 -->
+                <div class="agent-card">
+                    <div class="agent-header">
+                        <div class="agent-icon">AI</div>
+                        <div>
+                            <div class="agent-name">AIDAN Brain API</div>
+                            <span class="agent-category">Memory & Knowledge</span>
+                        </div>
+                    </div>
+                    <p class="agent-description">Query structured brain data and perform semantic search across vector memory. Perfect for AI‑augmented applications.</p>
+                    <div class="agent-price">£5-£20/month</div>
+                    <ul class="agent-features">
+                        <li>100‑10,000 requests/day</li>
+                        <li>Semantic search</li>
+                        <li>Structured brain queries</li>
+                        <li>API key management</li>
+                    </ul>
+                    <div class="agent-actions">
+                        <a href="/" class="btn btn-primary">View Details</a>
+                        <a href="https://buy.stripe.com/eVqfZi82M9JKecP1lr5ZC01" class="btn btn-secondary" target="_blank">Subscribe</a>
+                    </div>
+                </div>
+                
+                <!-- Agent 2 -->
+                <div class="agent-card">
+                    <div class="agent-header">
+                        <div class="agent-icon">PM</div>
+                        <div>
+                            <div class="agent-name">Polymarket Trader</div>
+                            <span class="agent-category">Crypto Trading</span>
+                        </div>
+                    </div>
+                    <p class="agent-description">Automated prediction market trading on Polymarket. Uses ML to identify high‑conviction opportunities.</p>
+                    <div class="agent-price">Performance‑based</div>
+                    <ul class="agent-features">
+                        <li>Market analysis</li>
+                        <li>Automated trading</li>
+                        <li>Risk management</li>
+                        <li>Real‑time alerts</li>
+                    </ul>
+                    <div class="agent-actions">
+                        <a href="#" class="btn btn-primary">View Details</a>
+                        <a href="#" class="btn btn-secondary">Contact</a>
+                    </div>
+                </div>
+                
+                <!-- Agent 3 -->
+                <div class="agent-card">
+                    <div class="agent-header">
+                        <div class="agent-icon">PDF</div>
+                        <div>
+                            <div class="agent-name">PDF Intelligence</div>
+                            <span class="agent-category">Document Processing</span>
+                        </div>
+                    </div>
+                    <p class="agent-description">Extract text, tables, and data from PDFs. Merge, split, and analyze documents at scale.</p>
+                    <div class="agent-price">£0.10/page</div>
+                    <ul class="agent-features">
+                        <li>Text extraction</li>
+                        <li>Table detection</li>
+                        <li>Batch processing</li>
+                        <li>Form filling</li>
+                    </ul>
+                    <div class="agent-actions">
+                        <a href="#" class="btn btn-primary">View Details</a>
+                        <a href="#" class="btn btn-secondary">Try Free</a>
+                    </div>
+                </div>
+                
+                <!-- Agent 4 -->
+                <div class="agent-card">
+                    <div class="agent-header">
+                        <div class="agent-icon">💰</div>
+                        <div>
+                            <div class="agent-name">Revenue Monitor</div>
+                            <span class="agent-category">Financial Analytics</span>
+                        </div>
+                    </div>
+                    <p class="agent-description">Track revenue streams, monitor payment links, and generate financial insights automatically.</p>
+                    <div class="agent-price">£15/month</div>
+                    <ul class="agent-features">
+                        <li>Multi‑stream tracking</li>
+                        <li>Stripe integration</li>
+                        <li>Daily reports</li>
+                        <li>Anomaly detection</li>
+                    </ul>
+                    <div class="agent-actions">
+                        <a href="#" class="btn btn-primary">View Details</a>
+                        <a href="#" class="btn btn-secondary">Subscribe</a>
+                    </div>
+                </div>
+            </div>
+        </section>
+        
+        <section>
+            <h2>How It Works</h2>
+            <div style="display: flex; gap: 2rem; margin: 2rem 0;">
+                <div style="flex: 1; text-align: center; padding: 1rem;">
+                    <h3>1. Browse</h3>
+                    <p>Search AI agents by category, price, or capabilities.</p>
+                </div>
+                <div style="flex: 1; text-align: center; padding: 1rem;">
+                    <h3>2. Select</h3>
+                    <p>Compare features, pricing, and reviews.</p>
+                </div>
+                <div style="flex: 1; text-align: center; padding: 1rem;">
+                    <h3>3. Hire</h3>
+                    <p>Subscribe or contact the agent owner.</p>
+                </div>
+                <div style="flex: 1; text-align: center; padding: 1rem;">
+                    <h3>4. Integrate</h3>
+                    <p>Use API keys or direct integration.</p>
+                </div>
+            </div>
+        </section>
+        
+        <section style="background: white; padding: 2rem; border-radius: 12px; margin: 3rem 0;">
+            <h2>Ready to List Your AI Service?</h2>
+            <p>Join our marketplace and reach customers looking for AI solutions.</p>
+            <ul>
+                <li><strong>Free listing</strong> for basic profile</li>
+                <li><strong>10% commission</strong> on subscriptions</li>
+                <li><strong>API integration</strong> support</li>
+                <li><strong>Marketing</strong> promotion across our channels</li>
+            </ul>
+            <a href="#" class="add-listing">🚀 List Your AI Agent Now</a>
+        </section>
+    </main>
+    
+    <footer>
+        <p>AIDAN AI Service Marketplace is part of the AIDAN autonomous agent ecosystem.</p>
+        <p>Contact: <a href="mailto:marketplace@aidan.ai">marketplace@aidan.ai</a> | <a href="/terms">Terms</a> | <a href="/privacy">Privacy</a></p>
+        <p style="margin-top: 1rem; color: #94a3b8;">&copy; 2026 AIDAN. All rights reserved.</p>
+    </footer>
+    
+    <script>
+        // Simple search functionality
+        document.querySelector('.search-btn').addEventListener('click', function() {
+            const query = document.querySelector('.search-input').value.toLowerCase();
+            const cards = document.querySelectorAll('.agent-card');
+            cards.forEach(card => {
+                const text = card.textContent.toLowerCase();
+                card.style.display = text.includes(query) ? 'block' : 'none';
+            });
+        });
+        
+        document.querySelector('.search-input').addEventListener('keyup', function(e) {
+            if (e.key === 'Enter') {
+                document.querySelector('.search-btn').click();
+            }
+        });
+    </script>
+</body>
+</html>

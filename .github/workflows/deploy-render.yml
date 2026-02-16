@@ -1,0 +1,38 @@
+name: Deploy to Render
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to Render
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+        run: |
+          if [ -z "$RENDER_API_KEY" ]; then
+            echo "RENDER_API_KEY not set. Skipping deployment."
+            exit 0
+          fi
+          curl -X POST "https://api.render.com/v1/services" \
+            -H "Accept: application/json" \
+            -H "Authorization: Bearer $RENDER_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "name": "revenue-api",
+              "type": "web_service",
+              "repo": "https://github.com/joenofro/revenue-api",
+              "branch": "main",
+              "runtime": "docker",
+              "plan": "free",
+              "envVars": [
+                {"key": "BRAIN_DB_PATH", "value": "data/aidan_brain.db"},
+                {"key": "STRIPE_SECRET_KEY", "sync": false},
+                {"key": "STRIPE_WEBHOOK_SECRET", "sync": false}
+              ]
+            }'

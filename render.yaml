@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: revenue-api
+    runtime: docker
+    repo: https://github.com/joenofro/revenue-api
+    branch: main
+    plan: free
+    envVars:
+      - key: BRAIN_DB_PATH
+        value: data/aidan_brain.db
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+    disk:
+      name: data
+      mountPath: /app/data
+      sizeGB: 1

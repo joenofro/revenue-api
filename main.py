@@ -5,27 +5,60 @@ Exposes brain database queries and ChromaDB semantic search via REST API.
 Rate-limited: free tier (100 req/day), paid tier (unlimited).
 """
 
+import html
+import hmac
 import json
+import logging
 import os
+import re
+import secrets
 import sqlite3
 import time
-from collections import defaultdict
+import ipaddress
 from typing import Optional
+from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Header, Request, File, UploadFile, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Header, Request, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
-import pypdf
-import httpx
+from starlette.middleware.base import BaseHTTPMiddleware
+
+logger = logging.getLogger("aidan-api")
+logging.basicConfig(level=logging.INFO)
 
 BRAIN_DB = os.environ.get("BRAIN_DB_PATH", os.path.expanduser("~/clawd/data/aidan_brain.db"))
-CHROMA_PATH = os.path.expanduser("~/Desktop/aidan/data/chromadb")
+CHROMA_PATH = os.environ.get("CHROMA_PATH", os.path.expanduser("~/Desktop/aidan/data/chromadb"))
+ADMIN_MASTER_KEY = os.environ.get("ADMIN_MASTER_KEY")
+MAX_PDF_SIZE = 10 * 1024 * 1024  # 10 MB
 
-# API keys — stored in database
-def get_key_info(api_key: str) -> dict:
-    conn = sqlite3.connect(BRAIN_DB)
+IS_PRODUCTION = os.environ.get("FLY_APP_NAME") is not None
+
+ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "").split(",") if os.environ.get("ALLOWED_ORIGINS") else [
+    "https://aidan-revenue-api.fly.dev",
+]
+# Allow localhost in dev
+if not IS_PRODUCTION:
+    ALLOWED_ORIGINS.extend(["http://localhost:8100", "http://127.0.0.1:8100"])
+
+# --- Helpers ---
+
+def mask_key(key: str) -> str:
+    if key and len(key) > 8:
+        return key[:6] + "..." + key[-4:]
+    return "***"
+
+
+def get_db():
+    conn = sqlite3.connect(BRAIN_DB, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.row_factory = sqlite3.Row
+    return conn
+
+
+def get_key_info(api_key: str) -> dict:
+    conn = get_db()
     try:
         row = conn.execute(
             "SELECT tier, customer_email as name, daily_limit, monthly_limit, subscription_status FROM api_keys WHERE api_key = ? AND subscription_status = 'active'",
@@ -33,70 +66,24 @@ def get_key_info(api_key: str) -> dict:
         ).fetchone()
         if row:
             return {"tier": row["tier"], "name": row["name"], "daily_limit": row["daily_limit"]}
-        else:
-            return None
+        return None
     finally:
         conn.close()
 
-# Rate limiting: {api_key: {date: count}}
-rate_limits = defaultdict(lambda: defaultdict(int))
-RATE_LIMITS = {"free": 100, "paid": 10000}  # fallback
-
-app = FastAPI(
-    title="AIDAN Brain API",
-    description="AI-powered memory and knowledge search. Query structured brain data or perform semantic search across vector memory.",
-    version="0.1.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET", "POST"],
-    allow_headers=["*"],
-)
-
-# --- API usage logging middleware ---
-@app.middleware("http")
-async def log_api_usage(request: Request, call_next):
-    start_time = time.time()
-    response = await call_next(request)
-    duration_ms = int((time.time() - start_time) * 1000)
-    
-    # Extract API key from header
-    api_key = request.headers.get("x-api-key")
-    if not api_key:
-        api_key = request.headers.get("X-API-Key")
-    
-    print(f"API usage logging: endpoint={request.url.path}, api_key={api_key}")
-    
-    # Only log if API key present
-    if api_key:
-        endpoint = request.url.path
-        status_code = response.status_code
-        conn = sqlite3.connect(BRAIN_DB)
-        try:
-            conn.execute(
-                "INSERT INTO api_usage_log (api_key, endpoint, response_time_ms, status_code) VALUES (?, ?, ?, ?)",
-                (api_key, endpoint, duration_ms, status_code)
-            )
-            conn.commit()
-        except Exception as e:
-            # Log but don't fail the request
-            print(f"Failed to log API usage: {e}")
-        finally:
-            conn.close()
-    
-    return response
 
 def check_rate_limit(api_key: str, limit: int) -> bool:
+    """Check rate limit using persistent database counts instead of in-memory."""
     today = time.strftime("%Y-%m-%d")
-    count = rate_limits[api_key][today]
-    if count >= limit:
-        return False
-    rate_limits[api_key][today] += 1
-    return True
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM api_usage_log WHERE api_key = ? AND date(created_at) = ?",
+            (api_key, today)
+        ).fetchone()
+        count = row[0] if row else 0
+        return count < limit
+    finally:
+        conn.close()
 
 
 def get_auth(x_api_key: Optional[str]) -> dict:
@@ -107,18 +94,40 @@ def get_auth(x_api_key: Optional[str]) -> dict:
         raise HTTPException(status_code=403, detail="Invalid API key")
     limit = info.get("daily_limit", 100)
     if not check_rate_limit(x_api_key, limit):
-        raise HTTPException(status_code=429, detail=f"Rate limit exceeded ({limit} req/day)")
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
     return info
 
 
-def get_db():
-    conn = sqlite3.connect(BRAIN_DB)
-    conn.row_factory = sqlite3.Row
-    return conn
+EMAIL_RE = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+
+VALID_CATEGORIES = {"api", "product", "service", "consulting"}
+
+BLOCKED_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "169.254.169.254", "[::1]", "metadata.google.internal"}
+
+
+def validate_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        if not parsed.hostname:
+            return False
+        if parsed.hostname in BLOCKED_HOSTS:
+            return False
+        try:
+            ip = ipaddress.ip_address(parsed.hostname)
+            if ip.is_private or ip.is_loopback or ip.is_link_local:
+                return False
+        except ValueError:
+            pass
+        return True
+    except Exception:
+        return False
 
 
 # --- ChromaDB lazy init ---
 _chroma_client = None
+
 
 def get_chroma():
     global _chroma_client
@@ -131,6 +140,85 @@ def get_chroma():
     return _chroma_client
 
 
+# --- Security Headers Middleware ---
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
+        return response
+
+
+# --- App ---
+app = FastAPI(
+    title="AIDAN Brain API",
+    description="AI-powered memory and knowledge search.",
+    version="0.2.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+)
+
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT"],
+    allow_headers=["X-API-Key", "Content-Type", "Stripe-Signature"],
+)
+
+
+# --- API usage logging middleware ---
+@app.middleware("http")
+async def log_api_usage(request: Request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    duration_ms = int((time.time() - start_time) * 1000)
+
+    api_key = request.headers.get("x-api-key") or request.headers.get("X-API-Key")
+
+    if api_key:
+        endpoint = request.url.path
+        status_code = response.status_code
+        try:
+            conn = get_db()
+            try:
+                conn.execute(
+                    "INSERT INTO api_usage_log (api_key, endpoint, response_time_ms, status_code) VALUES (?, ?, ?, ?)",
+                    (api_key, endpoint, duration_ms, status_code)
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.warning(f"Failed to log API usage: {e}")
+
+    return response
+
+
+# --- IP-based rate limiting for registration ---
+_registration_attempts = {}  # {ip: [timestamps]}
+MAX_REGISTRATIONS_PER_IP = 3
+REGISTRATION_WINDOW_SECONDS = 3600  # 1 hour
+
+
+def check_registration_rate(ip: str) -> bool:
+    now = time.time()
+    if ip not in _registration_attempts:
+        _registration_attempts[ip] = []
+    # Clean old entries
+    _registration_attempts[ip] = [t for t in _registration_attempts[ip] if now - t < REGISTRATION_WINDOW_SECONDS]
+    if len(_registration_attempts[ip]) >= MAX_REGISTRATIONS_PER_IP:
+        return False
+    _registration_attempts[ip].append(now)
+    return True
+
+
 # --- Models ---
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=500, description="Search query text")
@@ -141,43 +229,63 @@ class SearchRequest(BaseModel):
 class BrainQueryRequest(BaseModel):
     query_type: str = Field(..., description="Type: goals, learnings, procedures, metrics, tasks, self_model")
     limit: int = Field(10, ge=1, le=50)
-    status_filter: Optional[str] = Field(None, description="Filter by status (e.g., 'active', 'completed')")
+    status_filter: Optional[str] = Field(None, max_length=50, description="Filter by status")
+
 
 class RegistrationRequest(BaseModel):
-    email: str = Field(..., description="Customer email")
-    tier: str = Field("free", description="Tier: free, basic, pro")
+    email: str = Field(..., min_length=5, max_length=255, description="Customer email")
+
 
 class AdminCreateKeyRequest(BaseModel):
-    email: str = Field(..., description="Customer email")
+    email: str = Field(..., min_length=5, max_length=255, description="Customer email")
     tier: str = Field("basic", description="Tier: free, basic, pro")
-    daily_limit: Optional[int] = Field(None, description="Override daily limit")
+    daily_limit: Optional[int] = Field(None, ge=1, le=100000, description="Override daily limit")
+
 
 class PriceMonitorRequest(BaseModel):
-    product_url: str = Field(..., description="URL of product to monitor")
-    email: str = Field(..., description="Customer email for alerts")
-    interval_hours: int = Field(24, description="Check interval in hours")
+    product_url: str = Field(..., max_length=2000, description="URL of product to monitor")
+    email: str = Field(..., min_length=5, max_length=255, description="Customer email for alerts")
+    interval_hours: int = Field(24, ge=1, le=720, description="Check interval in hours")
+
+
+class RevenueStream(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200, description="Name of the revenue stream")
+    category: str = Field(..., max_length=50, description="Category (api, product, service, consulting)")
+    monthly_revenue: float = Field(0.0, ge=0, le=1000000, description="Current monthly revenue in GBP")
+    potential_monthly: float = Field(..., ge=0, le=1000000, description="Potential monthly revenue in GBP")
+    growth_rate: float = Field(0.0, ge=-100, le=10000, description="Monthly growth rate percentage")
+    notes: Optional[str] = Field(None, max_length=1000, description="Additional notes")
+
+
+class RevenueStreamUpdate(BaseModel):
+    monthly_revenue: Optional[float] = Field(None, ge=0, le=1000000)
+    potential_monthly: Optional[float] = Field(None, ge=0, le=1000000)
+    growth_rate: Optional[float] = Field(None, ge=-100, le=10000)
+    notes: Optional[str] = Field(None, max_length=1000)
+
 
 # --- Endpoints ---
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    with open("static/index.html", "r") as f:
-        return f.read()
+    try:
+        with open("static/index.html", "r") as f:
+            return f.read()
+    except FileNotFoundError:
+        return HTMLResponse("<h1>AIDAN Brain API</h1><p>API is running.</p>")
+
 
 @app.get("/api")
 async def api_info():
     return {
         "service": "AIDAN Brain API",
-        "version": "0.1.0",
-        "docs": "/docs",
+        "version": "0.2.0",
         "endpoints": {
             "GET /health": "Service health check",
-            "GET /brain/status": "Brain database overview",
-            "POST /brain/query": "Query structured brain data",
-            "POST /search": "Semantic search across vector memory",
-            "GET /brain/goals": "List active goals",
-            "GET /brain/learnings": "Recent learnings",
-            "POST /api/register": "Register for API key",
+            "GET /brain/status": "Brain database overview (requires API key)",
+            "POST /brain/query": "Query structured brain data (requires API key)",
+            "POST /search": "Semantic search (requires API key)",
+            "POST /api/register": "Register for free API key",
         },
     }
 
@@ -185,12 +293,7 @@ async def api_info():
 @app.get("/health")
 async def health():
     db_ok = os.path.exists(BRAIN_DB)
-    chroma_ok = get_chroma() is not None
-    return {
-        "status": "healthy" if db_ok else "degraded",
-        "brain_db": db_ok,
-        "chromadb": chroma_ok,
-    }
+    return {"status": "healthy" if db_ok else "degraded"}
 
 
 @app.get("/brain/status")
@@ -306,7 +409,7 @@ async def semantic_search(req: SearchRequest, x_api_key: Optional[str] = Header(
 
     client = get_chroma()
     if not client:
-        raise HTTPException(status_code=503, detail="ChromaDB not available")
+        raise HTTPException(status_code=503, detail="Search service not available")
 
     valid_collections = ["aidan_memory", "aidan_procedures", "aidan_reflections"]
     if req.collection not in valid_collections:
@@ -316,7 +419,8 @@ async def semantic_search(req: SearchRequest, x_api_key: Optional[str] = Header(
         collection = client.get_collection(req.collection)
         results = collection.query(query_texts=[req.query], n_results=req.limit)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"ChromaDB search failed: {e}")
+        raise HTTPException(status_code=500, detail="Search failed")
 
     items = []
     if results["documents"] and results["documents"][0]:
@@ -334,135 +438,179 @@ async def semantic_search(req: SearchRequest, x_api_key: Optional[str] = Header(
         "results": items,
     }
 
+
 @app.post("/api/register")
-async def register(req: RegistrationRequest):
-    import secrets
+async def register(req: RegistrationRequest, request: Request):
+    # Validate email format
+    if not EMAIL_RE.match(req.email):
+        raise HTTPException(status_code=400, detail="Invalid email format")
+
+    # IP-based rate limit on registration
+    client_ip = request.client.host if request.client else "unknown"
+    if not check_registration_rate(client_ip):
+        raise HTTPException(status_code=429, detail="Too many registrations. Try again later.")
+
+    # Only free tier via self-registration — paid tiers via Stripe webhook only
+    tier = "free"
+    daily_limit = 100
+    monthly_limit = 3000
+
     api_key = "sk_" + secrets.token_urlsafe(32)
-    tier = req.tier
-    # Determine daily limit based on tier
-    limits = {"free": 100, "basic": 1000, "pro": 10000}
-    daily_limit = limits.get(tier, 100)
-    monthly_limit = daily_limit * 30
-    conn = sqlite3.connect(BRAIN_DB)
+    conn = get_db()
     try:
+        # Check if email already has an active key
+        existing = conn.execute(
+            "SELECT api_key FROM api_keys WHERE customer_email = ? AND subscription_status = 'active' LIMIT 1",
+            (req.email,)
+        ).fetchone()
+        if existing:
+            raise HTTPException(status_code=409, detail="An API key already exists for this email. Contact support if you need a new key.")
+
         conn.execute(
-            "INSERT INTO api_keys (api_key, tier, customer_email, daily_limit, monthly_limit, subscription_status) VALUES (?, ?, ?, ?, ?, 'active')",
+            "INSERT INTO api_keys (api_key, tier, customer_email, daily_limit, monthly_limit, subscription_status, email_sent, email_sent_at) VALUES (?, ?, ?, ?, ?, 'active', 0, NULL)",
             (api_key, tier, req.email, daily_limit, monthly_limit)
         )
         conn.commit()
+    except HTTPException:
+        raise
     except sqlite3.IntegrityError:
-        raise HTTPException(status_code=400, detail="API key collision (retry)")
+        raise HTTPException(status_code=500, detail="Registration failed. Please try again.")
     finally:
         conn.close()
+
+    logger.info(f"Registered free key {mask_key(api_key)} for {req.email}")
     return {"api_key": api_key, "tier": tier, "daily_limit": daily_limit, "message": "Keep this key secure."}
+
 
 @app.post("/api/admin/create_key")
 async def admin_create_key(req: AdminCreateKeyRequest, x_master_key: Optional[str] = Header(None)):
-    # Hardcoded master key for now - should be moved to env
-    MASTER_KEY = "master_key_ChangeMe"
-    if x_master_key != MASTER_KEY:
-        raise HTTPException(status_code=403, detail="Invalid master key")
-    import secrets
-    api_key = "sk_" + secrets.token_urlsafe(32)
-    tier = req.tier
-    limits = {"free": 100, "basic": 1000, "pro": 10000}
-    daily_limit = req.daily_limit if req.daily_limit is not None else limits.get(tier, 100)
+    # Admin key from environment — endpoint disabled if not configured
+    if not ADMIN_MASTER_KEY:
+        raise HTTPException(status_code=503, detail="Admin endpoint not configured")
+    if not x_master_key or not hmac.compare_digest(x_master_key, ADMIN_MASTER_KEY):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    if not EMAIL_RE.match(req.email):
+        raise HTTPException(status_code=400, detail="Invalid email format")
+
+    valid_tiers = {"free", "basic", "pro", "revenue_api"}
+    if req.tier not in valid_tiers:
+        raise HTTPException(status_code=400, detail=f"Invalid tier. Use: {list(valid_tiers)}")
+
+    limits = {"free": 100, "basic": 1000, "pro": 10000, "revenue_api": 5000}
+    daily_limit = req.daily_limit if req.daily_limit is not None else limits.get(req.tier, 100)
     monthly_limit = daily_limit * 30
-    conn = sqlite3.connect(BRAIN_DB)
+
+    api_key = "sk_" + secrets.token_urlsafe(32)
+    conn = get_db()
     try:
         conn.execute(
-            "INSERT INTO api_keys (api_key, tier, customer_email, daily_limit, monthly_limit, subscription_status) VALUES (?, ?, ?, ?, ?, 'active')",
-            (api_key, tier, req.email, daily_limit, monthly_limit)
+            "INSERT INTO api_keys (api_key, tier, customer_email, daily_limit, monthly_limit, subscription_status, email_sent, email_sent_at) VALUES (?, ?, ?, ?, ?, 'active', 0, NULL)",
+            (api_key, req.tier, req.email, daily_limit, monthly_limit)
         )
         conn.commit()
     except sqlite3.IntegrityError:
-        raise HTTPException(status_code=400, detail="API key collision (retry)")
+        raise HTTPException(status_code=500, detail="Key generation failed. Retry.")
     finally:
         conn.close()
-    return {"api_key": api_key, "tier": tier, "daily_limit": daily_limit, "message": "Admin created key."}
+
+    logger.info(f"Admin created {req.tier} key {mask_key(api_key)} for {req.email}")
+    return {"api_key": api_key, "tier": req.tier, "daily_limit": daily_limit}
+
 
 @app.post("/stripe/webhook")
 async def stripe_webhook(request: Request):
     import stripe
-    import json
-    import secrets
-    import sqlite3
-    stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "sk_test_placeholder")
-    webhook_secret = os.environ.get("STRIPE_WEBHOOK_SECRET", "whsec_placeholder")
+
+    stripe_secret = os.environ.get("STRIPE_SECRET_KEY")
+    webhook_secret = os.environ.get("STRIPE_WEBHOOK_SECRET")
+
+    if not stripe_secret or not webhook_secret:
+        raise HTTPException(status_code=503, detail="Payment processing not configured")
+
+    stripe.api_key = stripe_secret
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature")
+
+    if not sig_header:
+        raise HTTPException(status_code=400, detail="Missing signature")
+
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, webhook_secret)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid payload: {e}")
-    except stripe.error.SignatureVerificationError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid signature: {e}")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
 
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
         customer_email = session.get("customer_email", "")
-        # Extract price ID from line items
         line_items = session.get("line_items", {}).get("data", [])
         price_id = None
         if line_items:
             price_id = line_items[0].get("price", {}).get("id")
         if not price_id:
-            # fallback to metadata
             price_id = session.get("metadata", {}).get("price_id")
-        # Map price ID to tier/product
-        DASHBOARD_PRICE = "price_1T1MFxLnWY7IoSqmd8R3pGJV"
+
+        # Price-to-tier mapping from environment or defaults
+        DASHBOARD_PRICE = os.environ.get("STRIPE_DASHBOARD_PRICE", "price_1T1MFxLnWY7IoSqmd8R3pGJV")
         if price_id == DASHBOARD_PRICE:
-            # Insert into dashboard subscriptions
-            conn = sqlite3.connect(BRAIN_DB)
+            conn = get_db()
             try:
                 conn.execute(
                     "INSERT INTO dashboard_subscriptions (customer_email, price_id, stripe_session_id, status) VALUES (?, ?, ?, 'active')",
                     (customer_email, price_id, session.get("id"))
                 )
                 conn.commit()
-                print(f"Created dashboard subscription for {customer_email}")
+                logger.info(f"Dashboard subscription created for {customer_email}")
             finally:
                 conn.close()
             return {"status": "dashboard_subscription_created"}
-        
-        # Existing API key products
+
         price_to_tier = {
-            "price_1SzPt7LnWY7IoSqm5YXJEHwy": "basic",
-            "price_1SzPtMLnWY7IoSqm83uF3GM0": "pro",
-            "price_1T0LN1LnWY7IoSqmOIELPsqF": "revenue_api"
+            os.environ.get("STRIPE_BASIC_PRICE", "price_1SzPt7LnWY7IoSqm5YXJEHwy"): "basic",
+            os.environ.get("STRIPE_PRO_PRICE", "price_1SzPtMLnWY7IoSqm83uF3GM0"): "pro",
+            os.environ.get("STRIPE_REVENUE_PRICE", "price_1T0LN1LnWY7IoSqmOIELPsqF"): "revenue_api",
         }
         tier = price_to_tier.get(price_id, "basic")
         limits = {"basic": 1000, "pro": 10000, "revenue_api": 5000}
         daily_limit = limits.get(tier, 1000)
-        # Generate API key
+
         api_key = "sk_" + secrets.token_urlsafe(32)
-        conn = sqlite3.connect(BRAIN_DB)
+        conn = get_db()
         try:
             conn.execute(
-                "INSERT INTO api_keys (api_key, tier, customer_email, daily_limit, monthly_limit, subscription_status) VALUES (?, ?, ?, ?, ?, 'active')",
+                "INSERT INTO api_keys (api_key, tier, customer_email, daily_limit, monthly_limit, subscription_status, email_sent, email_sent_at) VALUES (?, ?, ?, ?, ?, 'active', 0, NULL)",
                 (api_key, tier, customer_email, daily_limit, daily_limit * 30)
             )
             conn.commit()
+            logger.info(f"Stripe key created for {customer_email} tier {tier}")
         except sqlite3.IntegrityError:
-            # key collision, retry once
             api_key = "sk_" + secrets.token_urlsafe(32)
             conn.execute(
-                "INSERT INTO api_keys (api_key, tier, customer_email, daily_limit, monthly_limit, subscription_status) VALUES (?, ?, ?, ?, ?, 'active')",
+                "INSERT INTO api_keys (api_key, tier, customer_email, daily_limit, monthly_limit, subscription_status, email_sent, email_sent_at) VALUES (?, ?, ?, ?, ?, 'active', 0, NULL)",
                 (api_key, tier, customer_email, daily_limit, daily_limit * 30)
             )
             conn.commit()
         finally:
             conn.close()
-        # TODO: send email with API key
-        print(f"Created API key {api_key} for {customer_email} tier {tier}")
+
     return {"status": "received"}
+
 
 @app.post("/pdf/extract")
 async def pdf_extract(file: UploadFile = File(...), x_api_key: Optional[str] = Header(None)):
     auth = get_auth(x_api_key)
-    if file.content_type != "application/pdf":
-        raise HTTPException(status_code=400, detail="File must be PDF")
-    contents = await file.read()
+
+    # Read with size limit
+    contents = await file.read(MAX_PDF_SIZE + 1)
+    if len(contents) > MAX_PDF_SIZE:
+        raise HTTPException(status_code=413, detail="File too large (max 10MB)")
+
+    # Validate PDF magic bytes, not client-supplied content-type
+    if not contents.startswith(b'%PDF'):
+        raise HTTPException(status_code=400, detail="File must be a valid PDF")
+
     import tempfile
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp.write(contents)
@@ -471,31 +619,29 @@ async def pdf_extract(file: UploadFile = File(...), x_api_key: Optional[str] = H
         from pypdf import PdfReader
         reader = PdfReader(tmp_path)
         text = ""
-        for page in reader.pages:
-            text += page.extract_text()
-        return {"filename": file.filename, "pages": len(reader.pages), "text": text}
+        for page in reader.pages[:100]:  # Cap at 100 pages
+            text += page.extract_text() or ""
+        return {"filename": file.filename, "pages": len(reader.pages), "text": text[:50000]}  # Cap text output
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"PDF extraction failed: {str(e)}")
+        logger.error(f"PDF extraction failed: {e}")
+        raise HTTPException(status_code=500, detail="PDF extraction failed")
     finally:
-        import os
         os.unlink(tmp_path)
+
 
 @app.post("/monitor/price")
 async def price_monitor(req: PriceMonitorRequest, x_api_key: Optional[str] = Header(None)):
     auth = get_auth(x_api_key)
-    conn = sqlite3.connect(BRAIN_DB)
+
+    if not EMAIL_RE.match(req.email):
+        raise HTTPException(status_code=400, detail="Invalid email format")
+
+    if not validate_url(req.product_url):
+        raise HTTPException(status_code=400, detail="Invalid or blocked URL")
+
+    conn = get_db()
     try:
         cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS price_monitor_jobs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                product_url TEXT NOT NULL,
-                email TEXT NOT NULL,
-                interval_hours INTEGER DEFAULT 24,
-                status TEXT DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
         cursor.execute(
             "INSERT INTO price_monitor_jobs (product_url, email, interval_hours, status) VALUES (?, ?, ?, 'pending')",
             (req.product_url, req.email, req.interval_hours)
@@ -503,86 +649,61 @@ async def price_monitor(req: PriceMonitorRequest, x_api_key: Optional[str] = Hea
         job_id = cursor.lastrowid
         conn.commit()
     except sqlite3.Error as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        logger.error(f"Price monitor DB error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create monitoring job")
     finally:
         conn.close()
-    return {"job_id": job_id, "message": "Price monitoring job created. You will receive alerts via email."}
+    return {"job_id": job_id, "message": "Price monitoring job created."}
 
-# Revenue Streams Models
-class RevenueStream(BaseModel):
-    name: str = Field(..., description="Name of the revenue stream")
-    category: str = Field(..., description="Category (api, product, service, consulting)")
-    monthly_revenue: float = Field(0.0, description="Current monthly revenue in GBP")
-    potential_monthly: float = Field(..., description="Potential monthly revenue in GBP")
-    growth_rate: float = Field(0.0, description="Monthly growth rate percentage")
-    notes: Optional[str] = Field(None, description="Additional notes")
-
-class RevenueStreamUpdate(BaseModel):
-    monthly_revenue: Optional[float] = None
-    potential_monthly: Optional[float] = None
-    growth_rate: Optional[float] = None
-    notes: Optional[str] = None
-
-class PolymarketAnalyticsRequest(BaseModel):
-    category: Optional[str] = None
-    limit: int = Field(10, ge=1, le=50)
-    min_volume: Optional[float] = None
-    active_only: bool = True
 
 @app.post("/revenue/streams")
 async def create_revenue_stream(stream: RevenueStream, x_api_key: Optional[str] = Header(None)):
-    """Create a new revenue stream tracking entry"""
     auth = get_auth(x_api_key)
-    conn = sqlite3.connect(BRAIN_DB)
+
+    if stream.category not in VALID_CATEGORIES:
+        raise HTTPException(status_code=400, detail=f"Invalid category. Use: {list(VALID_CATEGORIES)}")
+
+    # Sanitize text fields
+    safe_name = html.escape(stream.name)
+    safe_notes = html.escape(stream.notes) if stream.notes else None
+
+    conn = get_db()
     try:
         cursor = conn.cursor()
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS revenue_streams (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                category TEXT NOT NULL,
-                monthly_revenue REAL DEFAULT 0.0,
-                potential_monthly REAL NOT NULL,
-                growth_rate REAL DEFAULT 0.0,
-                notes TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        cursor.execute("""
             INSERT INTO revenue_streams (name, category, monthly_revenue, potential_monthly, growth_rate, notes)
             VALUES (?, ?, ?, ?, ?, ?)
-        """, (stream.name, stream.category, stream.monthly_revenue, stream.potential_monthly, stream.growth_rate, stream.notes))
+        """, (safe_name, stream.category, stream.monthly_revenue, stream.potential_monthly, stream.growth_rate, safe_notes))
         stream_id = cursor.lastrowid
         conn.commit()
     except sqlite3.Error as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        logger.error(f"Revenue stream DB error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create revenue stream")
     finally:
         conn.close()
     return {"stream_id": stream_id, "message": "Revenue stream created successfully"}
 
+
 @app.get("/revenue/streams")
 async def get_revenue_streams(x_api_key: Optional[str] = Header(None)):
-    """Get all revenue streams"""
     auth = get_auth(x_api_key)
-    conn = sqlite3.connect(BRAIN_DB)
-    conn.row_factory = sqlite3.Row
+    conn = get_db()
     try:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM revenue_streams ORDER BY created_at DESC")
         streams = cursor.fetchall()
         return [dict(stream) for stream in streams]
     except sqlite3.Error as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        logger.error(f"Revenue streams query error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve revenue streams")
     finally:
         conn.close()
 
+
 @app.get("/revenue/streams/{stream_id}")
 async def get_revenue_stream(stream_id: int, x_api_key: Optional[str] = Header(None)):
-    """Get a specific revenue stream by ID"""
     auth = get_auth(x_api_key)
-    conn = sqlite3.connect(BRAIN_DB)
-    conn.row_factory = sqlite3.Row
+    conn = get_db()
     try:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM revenue_streams WHERE id = ?", (stream_id,))
@@ -591,18 +712,18 @@ async def get_revenue_stream(stream_id: int, x_api_key: Optional[str] = Header(N
             raise HTTPException(status_code=404, detail="Revenue stream not found")
         return dict(stream)
     except sqlite3.Error as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        logger.error(f"Revenue stream query error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve revenue stream")
     finally:
         conn.close()
 
+
 @app.put("/revenue/streams/{stream_id}")
 async def update_revenue_stream(stream_id: int, update: RevenueStreamUpdate, x_api_key: Optional[str] = Header(None)):
-    """Update a revenue stream"""
     auth = get_auth(x_api_key)
-    conn = sqlite3.connect(BRAIN_DB)
+    conn = get_db()
     try:
         cursor = conn.cursor()
-        # Build update query dynamically based on provided fields
         updates = []
         params = []
         if update.monthly_revenue is not None:
@@ -616,34 +737,35 @@ async def update_revenue_stream(stream_id: int, update: RevenueStreamUpdate, x_a
             params.append(update.growth_rate)
         if update.notes is not None:
             updates.append("notes = ?")
-            params.append(update.notes)
-        
+            params.append(html.escape(update.notes))
+
         if not updates:
             raise HTTPException(status_code=400, detail="No fields to update")
-        
+
         updates.append("updated_at = CURRENT_TIMESTAMP")
         query = f"UPDATE revenue_streams SET {', '.join(updates)} WHERE id = ?"
         params.append(stream_id)
-        
+
         cursor.execute(query, params)
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="Revenue stream not found")
         conn.commit()
     except sqlite3.Error as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        logger.error(f"Revenue stream update error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update revenue stream")
     finally:
         conn.close()
     return {"message": "Revenue stream updated successfully"}
 
+
 @app.get("/revenue/summary")
 async def get_revenue_summary(x_api_key: Optional[str] = Header(None)):
-    """Get revenue summary statistics"""
     auth = get_auth(x_api_key)
-    conn = sqlite3.connect(BRAIN_DB)
+    conn = get_db()
     try:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT 
+            SELECT
                 COUNT(*) as total_streams,
                 COALESCE(SUM(monthly_revenue), 0) as total_monthly_revenue,
                 COALESCE(SUM(potential_monthly), 0) as total_potential_revenue,
@@ -656,27 +778,26 @@ async def get_revenue_summary(x_api_key: Optional[str] = Header(None)):
             "total_monthly_revenue": summary[1],
             "total_potential_revenue": summary[2],
             "avg_growth_rate": summary[3],
-            "revenue_gap": summary[2] - summary[1]  # Potential - Current
+            "revenue_gap": summary[2] - summary[1]
         }
     except sqlite3.Error as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        logger.error(f"Revenue summary error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve revenue summary")
     finally:
         conn.close()
 
+
 @app.get("/revenue/transactions")
 async def get_revenue_transactions(x_api_key: Optional[str] = Header(None)):
-    """Get actual revenue transactions from revenue_log"""
     auth = get_auth(x_api_key)
-    conn = sqlite3.connect(BRAIN_DB)
+    conn = get_db()
     try:
         cursor = conn.cursor()
-        # Total revenue
         cursor.execute("SELECT COUNT(*), SUM(amount) FROM revenue_log")
         count, total = cursor.fetchone()
         if total is None:
             total = 0.0
-        
-        # Revenue by source
+
         cursor.execute("""
             SELECT source, COUNT(*), SUM(amount)
             FROM revenue_log
@@ -687,13 +808,12 @@ async def get_revenue_transactions(x_api_key: Optional[str] = Header(None)):
             {"source": row[0], "transactions": row[1], "amount": row[2]}
             for row in cursor.fetchall()
         ]
-        
-        # Recent revenue (last 30 days)
+
         from datetime import datetime, timedelta
         thirty_days_ago = (datetime.now() - timedelta(days=30)).date().isoformat()
         cursor.execute("SELECT SUM(amount) FROM revenue_log WHERE date >= ?", (thirty_days_ago,))
         recent_total = cursor.fetchone()[0] or 0.0
-        
+
         return {
             "total_transactions": count,
             "total_revenue": total,
@@ -701,31 +821,30 @@ async def get_revenue_transactions(x_api_key: Optional[str] = Header(None)):
             "by_source": by_source
         }
     except sqlite3.Error as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        logger.error(f"Revenue transactions error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve transactions")
     finally:
         conn.close()
 
+
 @app.get("/revenue/dashboard")
 async def get_revenue_dashboard(x_api_key: Optional[str] = Header(None)):
-    """Get comprehensive revenue dashboard combining Stripe, USDC, and revenue streams"""
     auth = get_auth(x_api_key)
-    
-    # Revenue streams from brain DB
+
     total_streams = 0
     streams_monthly = 0.0
     streams_potential = 0.0
     transactions_total = 0.0
-    conn_brain = sqlite3.connect(BRAIN_DB)
+    conn_brain = get_db()
     try:
         cursor = conn_brain.cursor()
-        # Check if revenue_streams table exists
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='revenue_streams'")
         if cursor.fetchone():
             cursor.execute("""
-                SELECT 
-                    COUNT(*) as total_streams,
-                    COALESCE(SUM(monthly_revenue), 0) as total_monthly_revenue,
-                    COALESCE(SUM(potential_monthly), 0) as total_potential_revenue
+                SELECT
+                    COUNT(*),
+                    COALESCE(SUM(monthly_revenue), 0),
+                    COALESCE(SUM(potential_monthly), 0)
                 FROM revenue_streams
             """)
             streams_row = cursor.fetchone()
@@ -733,30 +852,24 @@ async def get_revenue_dashboard(x_api_key: Optional[str] = Header(None)):
                 total_streams = streams_row[0]
                 streams_monthly = streams_row[1]
                 streams_potential = streams_row[2]
-        
-        # Revenue transactions total
+
         cursor.execute("SELECT SUM(amount) FROM revenue_log")
         total_row = cursor.fetchone()
         transactions_total = total_row[0] or 0.0 if total_row else 0.0
     except sqlite3.Error as e:
-        # Log error but continue with defaults
-        print(f"Database error in revenue dashboard: {e}")
+        logger.warning(f"Revenue dashboard DB error: {e}")
     finally:
         conn_brain.close()
-    
-    # Daily aggregated revenue from revenue_aggregated.db
-    aggregated_db = os.path.expanduser("~/clawd/data/revenue_aggregated.db")
+
+    aggregated_db = os.environ.get("AGGREGATED_DB_PATH", os.path.expanduser("~/clawd/data/revenue_aggregated.db"))
     daily_stripe = 0.0
     daily_usdc = 0.0
     daily_count = 0
     if os.path.exists(aggregated_db):
-        conn_agg = sqlite3.connect(aggregated_db)
+        conn_agg = sqlite3.connect(aggregated_db, timeout=10)
         try:
             cursor = conn_agg.cursor()
-            cursor.execute("""
-                SELECT SUM(stripe_gbp), SUM(usdc), COUNT(*)
-                FROM daily_revenue
-            """)
+            cursor.execute("SELECT SUM(stripe_gbp), SUM(usdc), COUNT(*) FROM daily_revenue")
             row = cursor.fetchone()
             if row:
                 daily_stripe = row[0] or 0.0
@@ -766,10 +879,9 @@ async def get_revenue_dashboard(x_api_key: Optional[str] = Header(None)):
             pass
         finally:
             conn_agg.close()
-    
-    # Combined totals
+
     combined_total = streams_monthly + transactions_total + daily_stripe + daily_usdc
-    
+
     return {
         "revenue_streams": {
             "total_streams": total_streams,
@@ -785,23 +897,18 @@ async def get_revenue_dashboard(x_api_key: Optional[str] = Header(None)):
             "days_recorded": daily_count
         },
         "combined_total_revenue": combined_total,
-        "breakdown": {
-            "streams_monthly": streams_monthly,
-            "transactions": transactions_total,
-            "stripe_daily": daily_stripe,
-            "usdc_daily": daily_usdc
-        }
     }
+
 
 @app.get("/polymarket/markets")
 async def get_polymarket_markets(
     limit: int = 50,
     category: Optional[str] = None,
-    active_only: bool = True
+    active_only: bool = True,
+    x_api_key: Optional[str] = Header(None),
 ):
-    """Get Polymarket prediction markets data"""
-    conn = sqlite3.connect(BRAIN_DB)
-    conn.row_factory = sqlite3.Row
+    auth = get_auth(x_api_key)
+    conn = get_db()
     try:
         cursor = conn.cursor()
         query = "SELECT * FROM polymarket_markets"
@@ -815,28 +922,28 @@ async def get_polymarket_markets(
                 query += " WHERE category = ?"
             params.append(category)
         query += " ORDER BY volume24h DESC LIMIT ?"
-        params.append(limit)
-        
+        params.append(min(limit, 100))
+
         cursor.execute(query, params)
         rows = cursor.fetchall()
         markets = []
         for row in rows:
             market = dict(row)
-            # Parse JSON fields
             if market.get('outcomes'):
                 try:
                     market['outcomes'] = json.loads(market['outcomes'])
-                except:
+                except (json.JSONDecodeError, TypeError):
                     market['outcomes'] = []
             if market.get('raw_data'):
                 try:
                     market['raw_data'] = json.loads(market['raw_data'])
-                except:
+                except (json.JSONDecodeError, TypeError):
                     market['raw_data'] = {}
             markets.append(market)
         return {"markets": markets, "count": len(markets)}
     finally:
         conn.close()
+
 
 if __name__ == "__main__":
     import uvicorn

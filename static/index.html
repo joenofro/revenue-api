@@ -4,6 +4,16 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AIDAN Brain API - AI-Powered Memory & Knowledge Search</title>
+    <meta name="description" content="AI-powered memory and knowledge search as a service. Query structured brain data and perform semantic search across vector memory.">
+    <meta property="og:title" content="AIDAN Brain API - AI-Powered Memory & Knowledge Search">
+    <meta property="og:description" content="AI-powered memory and knowledge search as a service. Query structured brain data and perform semantic search across vector memory.">
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://aidan-revenue-api.fly.dev/">
+    <meta property="og:image" content="https://aidan-revenue-api.fly.dev/static/og-image.png">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="AIDAN Brain API - AI-Powered Memory & Knowledge Search">
+    <meta name="twitter:description" content="AI-powered memory and knowledge search as a service. Query structured brain data and perform semantic search across vector memory.">
+    <meta name="twitter:image" content="https://aidan-revenue-api.fly.dev/static/og-image.png">
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif; max-width: 800px; margin: 0 auto; padding: 2rem; line-height: 1.6; color: #333; }
         header { text-align: center; margin-bottom: 3rem; }
@@ -74,19 +84,40 @@
     </section>
 
     <section>
+        <h2>One‑time Purchases</h2>
+        <div class="pricing">
+            <div class="plan free">
+                <h3>API Credits</h3>
+                <div class="price">£5.00</div>
+                <p>1,000 extra API requests</p>
+                <p>Top up your usage without a subscription.</p>
+                <a class="cta" href="https://buy.stripe.com/fZuaEYgzi1deb0D9RX5ZC0x" target="_blank">Buy API Credits</a>
+            </div>
+            <div class="plan basic">
+                <h3>Donation</h3>
+                <div class="price">£1.00</div>
+                <p>Support AIDAN's development</p>
+                <p>Help fund autonomous AI research and improvement.</p>
+                <a class="cta" href="https://buy.stripe.com/8x2eVe96QaNOb0De8d5ZC0o" target="_blank">Make a Donation</a>
+            </div>
+        </div>
+        <p><em>One‑time purchases are delivered instantly.</em></p>
+    </section>
+
+    <section>
         <h2>Quick Start</h2>
         <p>1. Register for a free API key:</p>
-        <pre><code>curl -X POST https://api.yourdomain.com/api/register \
+        <pre><code>curl -X POST https://aidan-revenue-api.fly.dev/api/register \
   -H "Content-Type: application/json" \
   -d '{"email":"your@email.com","tier":"free"}'</code></pre>
         <p>2. Use the returned API key in the <code>X-API-Key</code> header:</p>
-        <pre><code>curl -H "X-API-Key: sk_..." https://api.yourdomain.com/brain/status</code></pre>
-        <p>3. Explore the interactive <a href="/docs">API documentation</a>.</p>
+        <pre><code>curl -H "X-API-Key: sk_..." https://aidan-revenue-api.fly.dev/brain/status</code></pre>
+        <p>3. Explore the interactive <a href="/static/docs.html">API documentation</a>.</p>
     </section>
 
     <section>
         <h2>Documentation</h2>
-        <p>Full API reference available at <a href="/docs">/docs</a> (Swagger UI).</p>
+        <p>Full API reference available at <a href="/static/docs.html">/static/docs.html</a> (static reference).</p>
     </section>
 
     <footer>
